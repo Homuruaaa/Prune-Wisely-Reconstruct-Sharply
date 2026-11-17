@@ -19,6 +19,12 @@ WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
     image = Image.open(cam_info.image_path)
+    if is_nerf_synthetic:
+        with image as source:
+            rgba = source.convert("RGBA")
+            color = "white" if args.white_background else "black"
+            image = Image.new("RGB", rgba.size, color)
+            image.paste(rgba, mask=rgba.getchannel("A"))
 
     if cam_info.depth_path != "":
         try:
