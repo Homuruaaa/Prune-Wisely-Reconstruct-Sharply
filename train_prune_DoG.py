@@ -9,7 +9,10 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import json
 import os
+from pathlib import Path
+from time import perf_counter
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -61,7 +64,7 @@ def reconstruction_detection(scene, gaussians, pipe, background, dataset):
         return total_loss / len(cameras)
 
 
-def prune(scene, gaussians, pipe, background, prune_ratio, dataset):
+def prune(scene, gaussians, pipe, background, prune_ratio, dataset, target=None, finish=False):
     torch.cuda.reset_peak_memory_stats()
 
     with torch.enable_grad():
@@ -107,7 +110,7 @@ def prune(scene, gaussians, pipe, background, prune_ratio, dataset):
 
         avg_loss = total_loss / len(cameras)
 
-    gaussians.prune_gaussians(prune_ratio, scores)
+    gaussians.prune_gaussians(prune_ratio, scores, target, finish)
     return avg_loss
 
 
@@ -116,6 +119,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         sys.exit(
             f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
 
+    switch = opt.pruning_stop_iter if opt.dog_start_iter == -1 else opt.dog_start_iter
+    if switch < 1:
+        raise ValueError("dog_start_iter must be positive or -1 for the baseline")
+    target = opt.pruning_target
+    if target is not None:
+        if not (0 < target and opt.densify_until_iter <= opt.pruning_start_iter
+                and opt.pruning_interval > 0
+                and opt.pruning_start_iter + opt.pruning_interval < opt.pruning_stop_iter <= opt.iterations):
+            raise ValueError("Exact-budget runs require a positive target and a complete pruning phase")
+        if checkpoint:
+            raise ValueError("Start exact-budget experiments from initialization")
+    prune_events = []
+    total_started = perf_counter()
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -142,6 +158,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     scheduler = TrainingScheduler(opt)
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    torch.cuda.synchronize()
+    started = perf_counter()
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
         if network_gui.conn == None:
@@ -151,7 +169,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer,
+                    preview_renderer = render_DoG if iteration >= switch else render
+                    net_image = preview_renderer(custom_cam, gaussians, pipe, background, scaling_modifier=scaling_modifer,
                                            use_trained_exp=dataset.train_test_exp)[
                         "render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2,
@@ -185,7 +204,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         render_pkg = render_training(
-            iteration, opt.pruning_stop_iter, viewpoint_cam, gaussians, pipe, bg,
+            iteration, switch, viewpoint_cam, gaussians, pipe, bg,
             dataset.train_test_exp,
         )
 
@@ -238,7 +257,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
-            if iteration < opt.pruning_stop_iter:
+            if iteration < switch:
                 render_func = render
                 render_args = (
                     pipe, background, 1.0, None,
@@ -270,6 +289,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians.reset_opacity()
 
             elif iteration == opt.pruning_start_iter:
+                if target is not None and gaussians.get_xyz.shape[0] < target:
+                    raise ValueError("Pruning target exceeds the post-densification Gaussian count")
                 loss_stamp = 1
                 iteration_no_prune = 0
                 pruning_count = 1
@@ -280,14 +301,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 pruning_count += 1
 
             elif (iteration - opt.pruning_start_iter) % opt.pruning_interval == 0 and (
-                    iteration > opt.pruning_start_iter and iteration < opt.pruning_stop_iter) and pruning_count <= 6:
+                    iteration > opt.pruning_start_iter and iteration < opt.pruning_stop_iter) and pruning_count <= 6 and (
+                        target is None or gaussians.get_xyz.shape[0] > target):
                 per_view_loss = reconstruction_detection(
                     scene, gaussians, pipe, background, dataset)
                 print("\n[loss_stamp {}],[per_view_loss {}]".format(loss_stamp, per_view_loss))
                 factor = args.beta
-                if per_view_loss < factor * loss_stamp or iteration_no_prune >= opt.pruning_interval_maximum:
+                finish = target is not None and (
+                    iteration + opt.pruning_interval >= opt.pruning_stop_iter or pruning_count == 6)
+                if finish or per_view_loss < factor * loss_stamp or iteration_no_prune >= opt.pruning_interval_maximum:
+                    before = gaussians.get_xyz.shape[0]
                     loss_stamp = prune(
-                        scene, gaussians, pipe, background, pruning_ratio, dataset)
+                        scene, gaussians, pipe, background, pruning_ratio, dataset, target, finish)
+                    after = gaussians.get_xyz.shape[0]
+                    if after < before:
+                        prune_events.append(dict(iteration=iteration, before=before, after=after))
                     iteration_no_prune = 0
                     pruning_ratio = scheduler.get_pruning_rate(iteration, gaussians.get_xyz.shape[0], pruning_count)
                     print("\n[ITER {}],[Pru_C {}]".format(iteration, pruning_count))
@@ -310,6 +338,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    torch.cuda.synchronize()
+    training_seconds = perf_counter() - started
+    count = gaussians.get_xyz.shape[0]
+    if target is not None and count != target:
+        raise RuntimeError(f"Expected {target} Gaussians, obtained {count}")
+    root = Path(scene.model_path)
+    ply = root / "point_cloud" / f"iteration_{opt.iterations}" / "point_cloud.ply"
+    summary = dict(dog_start_iter=switch, final_gaussians=count,
+                   model_ply_bytes=ply.stat().st_size, training_seconds=training_seconds,
+                   setup_and_training_seconds=perf_counter() - total_started,
+                   pruning_events=prune_events, options=vars(args))
+    (root / "training_summary.json").write_text(json.dumps(summary, indent=2))
 
 
 def prepare_output_and_logger(args):
@@ -407,13 +448,14 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
-    safe_state(args.quiet)
+    safe_state(args.quiet, args.seed)
 
     # Start GUI server, configure and run training
     if not args.disable_viewer:
