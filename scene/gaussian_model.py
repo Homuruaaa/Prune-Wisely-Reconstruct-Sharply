@@ -68,6 +68,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
+        self.tmp_radii = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
@@ -415,7 +416,16 @@ class GaussianModel:
         if self.tmp_radii is not None:
             self.tmp_radii = self.tmp_radii[valid_points_mask]
 
-    def prune_gaussians(self, percent, import_score):
+    def prune_gaussians(self, percent, import_score, target=None, finish=False):
+        if target is not None:
+            scores = import_score.flatten()
+            remaining = scores.numel() - target
+            count = remaining if finish else min(round(percent * scores.numel()), remaining)
+            if count > 0:
+                mask = torch.zeros_like(scores, dtype=torch.bool)
+                mask[torch.argsort(scores, stable=True)[:count]] = True
+                self.prune_points(mask)
+            return
         sorted_tensor, _ = torch.sort(import_score, dim=0)
         index_nth_percentile = int(percent * (sorted_tensor.shape[0] - 1))
         value_nth_percentile = sorted_tensor[index_nth_percentile]
