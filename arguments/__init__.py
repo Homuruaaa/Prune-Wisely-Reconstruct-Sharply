@@ -9,123 +9,95 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from argparse import ArgumentParser, Namespace
-import sys
 import os
+import random
+import json
+from utils.system_utils import searchForMaxIteration
+from scene.dataset_readers import sceneLoadTypeCallbacks
+from scene.gaussian_model import GaussianModel
+from arguments import ModelParams
+from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
-class GroupParams:
-    pass
+class Scene:
 
-class ParamGroup:
-    def __init__(self, parser: ArgumentParser, name : str, fill_none = False):
-        group = parser.add_argument_group(name)
-        for key, value in vars(self).items():
-            shorthand = False
-            if key.startswith("_"):
-                shorthand = True
-                key = key[1:]
-            t = type(value)
-            value = value if not fill_none else None 
-            if shorthand:
-                if t == bool:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
-                else:
-                    group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
+    gaussians : GaussianModel
+
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+        """b
+        :param path: Path to colmap scene main folder.
+        """
+        self.model_path = args.model_path
+        self.loaded_iter = None
+        self.gaussians = gaussians
+
+        if load_iteration:
+            if load_iteration == -1:
+                self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
             else:
-                if t == bool:
-                    group.add_argument("--" + key, default=value, action="store_true")
-                else:
-                    group.add_argument("--" + key, default=value, type=t)
+                self.loaded_iter = load_iteration
+            print("Loading trained model at iteration {}".format(self.loaded_iter))
 
-    def extract(self, args):
-        group = GroupParams()
-        for arg in vars(args).items():
-            if arg[0] in vars(self) or ("_" + arg[0]) in vars(self):
-                setattr(group, arg[0], arg[1])
-        return group
+        self.train_cameras = {}
+        self.test_cameras = {}
 
-class ModelParams(ParamGroup): 
-    def __init__(self, parser, sentinel=False):
-        self.sh_degree = 3
-        self._source_path = ""
-        self._model_path = ""
-        self._images = "images"
-        self._depths = ""
-        self._resolution = -1
-        self._white_background = False
-        self.train_test_exp = False
-        self.data_device = "cuda"
-        self.eval = True
-        super().__init__(parser, "Loading Parameters", sentinel)
+        if os.path.exists(os.path.join(args.source_path, "sparse")):
+            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
+        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+            print("Found transforms_train.json file, assuming Blender data set!")
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
+        else:
+            raise ValueError(
+                f"Unsupported dataset layout: {args.source_path}. "
+                "Expected a 'sparse' directory for COLMAP data or "
+                "'transforms_train.json' for Blender data.")
 
-    def extract(self, args):
-        g = super().extract(args)
-        g.source_path = os.path.abspath(g.source_path)
-        return g
+        if not self.loaded_iter:
+            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
+                dest_file.write(src_file.read())
+            json_cams = []
+            camlist = []
+            if scene_info.test_cameras:
+                camlist.extend(scene_info.test_cameras)
+            if scene_info.train_cameras:
+                camlist.extend(scene_info.train_cameras)
+            for id, cam in enumerate(camlist):
+                json_cams.append(camera_to_JSON(id, cam))
+            with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
+                json.dump(json_cams, file)
 
-class PipelineParams(ParamGroup):
-    def __init__(self, parser):
-        self.convert_SHs_python = False
-        self.compute_cov3D_python = False
-        self.debug = False
-        self.antialiasing = False
+        if shuffle:
+            random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
+            random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
-        super().__init__(parser, "Pipeline Parameters")
+        self.cameras_extent = scene_info.nerf_normalization["radius"]
 
-class OptimizationParams(ParamGroup):
-    def __init__(self, parser):
-        self.iterations = 40_000
-        self.position_lr_init = 0.00016
-        self.position_lr_final = 0.0000016
-        self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 30_000
-        self.feature_lr = 0.0025
-        self.opacity_lr = 0.025
-        self.scaling_lr = 0.005
-        self.rotation_lr = 0.001
-        self.exposure_lr_init = 0.01
-        self.exposure_lr_final = 0.001
-        self.exposure_lr_delay_steps = 0
-        self.exposure_lr_delay_mult = 0.0
-        self.percent_dense = 0.01
-        self.lambda_dssim = 0.2
-        self.densification_interval = 100
-        self.opacity_reset_interval = 3_000
-        self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
-        self.densify_grad_threshold = 0.0002
-        self.depth_l1_weight_init = 1.0
-        self.depth_l1_weight_final = 0.01
-        self.random_background = False
-        self.optimizer_type = "default"
+        for resolution_scale in resolution_scales:
+            print("Loading Training Cameras")
+            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
+            print("Loading Test Cameras")
+            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
 
-        self.pruning_interval = 500
-        self.pruning_interval_maximum = 1500
-        self.pruning_target = None
+        if self.loaded_iter:
+            self.gaussians.load_ply(os.path.join(self.model_path,
+                                                           "point_cloud",
+                                                           "iteration_" + str(self.loaded_iter),
+                                                           "point_cloud.ply"), args.train_test_exp)
+        else:
+            self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 
-        self.pruning_start_iter = 15_200
-        self.pruning_stop_iter = 25_200
+    def save(self, iteration):
+        point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
+        self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        exposure_dict = {
+            image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
+            for image_name in self.gaussians.exposure_mapping
+        }
 
-        super().__init__(parser, "Optimization Parameters")
+        with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
+            json.dump(exposure_dict, f, indent=2)
 
-def get_combined_args(parser : ArgumentParser):
-    cmdlne_string = sys.argv[1:]
-    cfgfile_string = "Namespace()"
-    args_cmdline = parser.parse_args(cmdlne_string)
+    def getTrainCameras(self, scale=1.0):
+        return self.train_cameras[scale]
 
-    try:
-        cfgfilepath = os.path.join(args_cmdline.model_path, "cfg_args")
-        print("Looking for config file in", cfgfilepath)
-        with open(cfgfilepath) as cfg_file:
-            print("Config file found: {}".format(cfgfilepath))
-            cfgfile_string = cfg_file.read()
-    except TypeError:
-        print("Config file not found at")
-        pass
-    args_cfgfile = eval(cfgfile_string)
-
-    merged_dict = vars(args_cfgfile).copy()
-    for k,v in vars(args_cmdline).items():
-        if v != None:
-            merged_dict[k] = v
-    return Namespace(**merged_dict)
+    def getTestCameras(self, scale=1.0):
+        return self.test_cameras[scale]
